@@ -1,11 +1,10 @@
-import React, { useState, useCallback, useRef } from 'react';
+import React, { useState, useCallback, useRef, useEffect } from 'react';
 import { Upload, Download, FileText, Settings2, Folder, Loader2 } from 'lucide-react';
 import { createWorker } from 'tesseract.js';
 import JSZip from 'jszip';
 import mammoth from 'mammoth';
 import * as pdfjsLib from 'pdfjs-dist';
 import * as xlsx from 'xlsx';
-import PptxGenJS from 'pptxgenjs';
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.10.377/pdf.worker.min.js';
 
@@ -29,16 +28,68 @@ type ProcessingStats = {
   failed: number;
 };
 
-const allowedExtensions: { [key: string]: string[] } = {
-  'application/msword': ['.doc', '.dot'],
-  'application/vnd.openxmlformats-officedocument.wordprocessingml.document': ['.docx'],
-  'application/vnd.ms-excel': ['.xls', '.xlt'],
-  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': ['.xlsx'],
-  'application/vnd.ms-powerpoint': ['.ppt', '.pot', '.pps'],
-  'application/vnd.openxmlformats-officedocument.presentationml.presentation': ['.pptx'],
-  'application/pdf': ['.pdf'],
-  'text/plain': ['.txt'],
-  // Adicione mais tipos MIME e extensões permitidas conforme necessário
+const processOfficeFile = async (file: File): Promise<string> => {
+  const extension = file.name.split('.').pop()?.toLowerCase();
+  const arrayBuffer = await file.arrayBuffer();
+
+  switch (extension) {
+    case 'doc':
+    case 'docx':
+      try {
+        const result = await mammoth.extractRawText({ arrayBuffer });
+        return result.value;
+      } catch (error) {
+        console.error('Error processing Word file:', error);
+        throw error;
+      }
+    case 'xls':
+    case 'xlsx':
+      try {
+        const workbook = xlsx.read(arrayBuffer, { type: 'array' });
+        let content = '';
+        workbook.SheetNames.forEach(sheetName => {
+          const sheet = workbook.Sheets[sheetName];
+          content += `Sheet: ${sheetName}\n`;
+          content += xlsx.utils.sheet_to_csv(sheet);
+          content += '\n\n';
+        });
+        return content;
+      } catch (error) {
+        console.error('Error processing Excel file:', error);
+        throw error;
+      }
+    case 'ppt':
+    case 'pptx':
+      try {
+        const zip = await JSZip.loadAsync(arrayBuffer);
+        let content = '';
+        const slideFiles = Object.keys(zip.files).filter(name => 
+          name.startsWith('ppt/slides/slide') && name.endsWith('.xml')
+        );
+        
+        for (const slideFile of slideFiles) {
+          const slideContent = await zip.file(slideFile)?.async('string');
+          if (slideContent) {
+            // Extract text from XML
+            const textMatches = slideContent.match(/>([^<]+)</g);
+            if (textMatches) {
+              content += `Slide ${slideFile.match(/\d+/)?.[0] || ''}\n`;
+              content += textMatches
+                .map(match => match.slice(1, -1).trim())
+                .filter(text => text.length > 0)
+                .join('\n');
+              content += '\n\n';
+            }
+          }
+        }
+        return content;
+      } catch (error) {
+        console.error('Error processing PowerPoint file:', error);
+        throw error;
+      }
+    default:
+      throw new Error(`Unsupported office file extension: ${extension}`);
+  }
 };
 
 function App() {
@@ -57,10 +108,19 @@ function App() {
   const [errorLogs, setErrorLogs] = useState<string[]>([]);
   const workerRef = useRef<any>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
+  const folderInputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    if (folderInputRef.current) {
+      folderInputRef.current.setAttribute('webkitdirectory', 'true');
+      folderInputRef.current.setAttribute('directory', 'true');
+    }
+  }, []);
 
   const initializeWorker = async () => {
     if (!workerRef.current) {
       const worker = await createWorker();
+      await worker.load();
       await worker.reinitialize('eng');
       workerRef.current = worker;
     }
@@ -86,62 +146,31 @@ function App() {
     setErrorLogs(prevLogs => [...prevLogs, logMessage]);
   };
 
-  async function verifyFileType(file: File): Promise<boolean> {
-    const fileExtension = file.name.split('.').pop()?.toLowerCase();
-    const mimeTypes = Object.keys(allowedExtensions);
-    const isValidExtension = mimeTypes.some(mime => allowedExtensions[mime].includes(`.${fileExtension}`));
-    
-    if (!isValidExtension) {
-      console.warn(`File type mismatch for ${file.name}: expected ${file.type}`);
-      return false;
-    }
-    return true;
-  }
-
   const processFile = async (file: File): Promise<ProcessedFile | null> => {
     try {
       let content = '';
-      const fileType = file.type;
+      const extension = file.name.split('.').pop()?.toLowerCase();
       const filePath = file.webkitRelativePath || file.name;
       const fileSize = file.size;
       const fileDate = file.lastModified ? new Date(file.lastModified).toLocaleString() : 'N/A';
 
-      console.log(`Processing file: ${file.name}, type: ${fileType}`);
+      console.log(`Processing file: ${file.name}, extension: ${extension}`);
 
-      if (fileType.startsWith('text/')) {
+      if (file.type.startsWith('text/')) {
         content = await file.text();
-      } else if (fileType.startsWith('image/')) {
+      } else if (file.type.startsWith('image/')) {
         content = await processImageFile(file);
-      } else if (fileType === 'application/pdf') {
+      } else if (file.type === 'application/pdf' || extension === 'pdf') {
         const pdf = await pdfjsLib.getDocument({ data: await file.arrayBuffer() }).promise;
         const numPages = pdf.numPages;
         for (let i = 1; i <= numPages; i++) {
           const page = await pdf.getPage(i);
           const textContent = await page.getTextContent();
           const pageText = textContent.items.map((item: any) => item.str).join(' ');
-          content += pageText + '\n';
+          content += `Page ${i}\n${pageText}\n\n`;
         }
-      } else if (fileType === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' || fileType === 'application/msword' || fileType === 'application/vnd.ms-word.document.macroEnabled.12') {
-        const arrayBuffer = await file.arrayBuffer();
-        const result = await mammoth.extractRawText({ arrayBuffer });
-        content = result.value;
-      } else if (fileType === 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' || fileType === 'application/vnd.ms-excel' || fileType === 'application/vnd.ms-excel.sheet.macroEnabled.12') {
-        const arrayBuffer = await file.arrayBuffer();
-        const workbook = xlsx.read(arrayBuffer, { type: 'array' });
-        workbook.SheetNames.forEach(sheetName => {
-          const sheet = workbook.Sheets[sheetName];
-          content += xlsx.utils.sheet_to_csv(sheet);
-        });
-      } else if (fileType === 'application/vnd.openxmlformats-officedocument.presentationml.presentation' || fileType === 'application/vnd.ms-powerpoint' || fileType === 'application/vnd.ms-powerpoint.presentation.macroEnabled.12') {
-        const arrayBuffer = await file.arrayBuffer();
-        const zip = await JSZip.loadAsync(arrayBuffer);
-        const pptxContent = await zip.file("ppt/slides/slide1.xml")?.async("string");
-        if (pptxContent) {
-          content = pptxContent;
-        }
-      } else if (fileType === 'application/vnd.lotus-freelance' || fileType === 'application/rtf') {
-        const result = await mammoth.extractRawText({ arrayBuffer: await file.arrayBuffer() });
-        content = result.value;
+      } else if (['doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx'].includes(extension || '')) {
+        content = await processOfficeFile(file);
       } else {
         updateStats(false);
         logError(file.name, new Error('Unsupported file type'));
@@ -151,8 +180,8 @@ function App() {
       updateStats(true);
       return {
         name: file.name,
-        content: `Informações do Arquivo Original:\nCaminho: ${filePath}\nNome: ${file.name}\nData: ${fileDate}\nTamanho: ${fileSize} bytes\n\n${content}`,
-        originalType: fileType,
+        content: `File Information:\nPath: ${filePath}\nName: ${file.name}\nDate: ${fileDate}\nSize: ${fileSize} bytes\n\nContent:\n${content}`,
+        originalType: extension || 'unknown',
         path: filePath
       };
     } catch (error) {
@@ -163,29 +192,10 @@ function App() {
     }
   };
 
-  const processFileWithTimeout = async (file: File, timeout: number): Promise<ProcessedFile | null> => {
-    return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        reject(new Error('File processing timed out'));
-      }, timeout);
-
-      processFile(file).then(result => {
-        clearTimeout(timer);
-        resolve(result);
-      }).catch(error => {
-        clearTimeout(timer);
-        reject(error);
-      });
-    });
-  };
-
   const handleFolderUpload = useCallback(async (event: React.ChangeEvent<HTMLInputElement>) => {
     const files = event.target.files;
     if (!files?.length) return;
 
-    console.log(`Selected ${files.length} files for processing`);
-
-    // Create new abort controller
     if (abortControllerRef.current) {
       abortControllerRef.current.abort();
     }
@@ -194,31 +204,48 @@ function App() {
     setIsProcessing(true);
     setProcessingStatus('Scanning files...');
     setStats({ total: files.length, processed: 0, failed: 0 });
+    setErrorLogs([]);
     
     const processedResults: ProcessedFile[] = [];
     const fileArray = Array.from(files);
-    const batchSize = 5; // Process 5 files concurrently
+    const batchSize = 5;
 
     try {
       for (let i = 0; i < fileArray.length; i += batchSize) {
+        if (abortControllerRef.current?.signal.aborted) {
+          throw new Error('Processing cancelled');
+        }
+
         const batch = fileArray.slice(i, i + batchSize);
-        console.log(`Processing batch ${i / batchSize + 1} of ${Math.ceil(fileArray.length / batchSize)}`);
-        const results = await Promise.all(batch.map(file => processFileWithTimeout(file, 30000).catch(error => {
-          console.error(`Error processing ${file.name}:`, error);
-          updateStats(false);
-          logError(file.name, error);
-          return null;
-        })));
-        processedResults.push(...results.filter(result => result !== null) as ProcessedFile[]);
+        const batchPromises = batch.map(file => {
+          setProcessingStatus(`Processing ${file.name} (${i + 1}/${files.length})`);
+          return processFile(file);
+        });
+
+        const results = await Promise.all(batchPromises);
+        const validResults = results.filter((result): result is ProcessedFile => result !== null);
+        processedResults.push(...validResults);
         setProcessedFiles(processedResults);
-        console.log(`Processed ${processedResults.length} files so far`);
+
+        const progress = Math.min(((i + batch.length) / files.length) * 100, 100);
+        setProcessingStatus(`Processed ${i + batch.length} of ${files.length} files (${progress.toFixed(1)}%)`);
       }
+
+      // Combine all processed content
+      const combinedText = processedResults
+        .map(file => `=== ${file.path} ===\n${file.content}\n`)
+        .join('\n');
+      setInputText(combinedText);
     } catch (error) {
-      console.error('Error processing files:', error);
+      if (error instanceof Error && error.message === 'Processing cancelled') {
+        setProcessingStatus('Processing cancelled');
+      } else {
+        console.error('Error processing files:', error);
+        setProcessingStatus('Error processing files');
+      }
     } finally {
       setIsProcessing(false);
-      setProcessingStatus('');
-      console.log('Finished processing all files');
+      abortControllerRef.current = null;
     }
   }, []);
 
@@ -250,7 +277,6 @@ function App() {
 
   const handleDownload = useCallback(async () => {
     if (processedFiles.length > 1) {
-      // Create a ZIP file containing all converted files
       const zip = new JSZip();
       
       processedFiles.forEach(file => {
@@ -267,7 +293,6 @@ function App() {
           converted = converted.replace(/\n/g, '\r');
         }
         
-        // Preserve folder structure in ZIP
         const fileName = file.path.replace(/\.[^/.]+$/, '') + '.txt';
         zip.file(fileName, converted);
       });
@@ -289,7 +314,6 @@ function App() {
       document.body.removeChild(a);
       URL.revokeObjectURL(url);
     } else {
-      // Download single file
       const blob = new Blob([outputText], { type: 'text/plain;charset=utf-8' });
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
@@ -324,7 +348,7 @@ function App() {
                   <input
                     type="file"
                     className="hidden"
-                    accept=".txt,.doc,.docx,.pdf,.ppt,.pptx,.pez,.rtf,image/*"
+                    accept=".txt,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.pdf,.rtf,image/*"
                     onChange={handleFolderUpload}
                   />
                 </label>
@@ -334,9 +358,9 @@ function App() {
                   <input
                     type="file"
                     className="hidden"
+                    ref={folderInputRef}
                     multiple
-                    onChange={handleFolderUpload}
-                    {...({ webkitdirectory: '', directory: '' } as React.InputHTMLAttributes<HTMLInputElement>)}
+                    onChange={handleFolderUpload as any}
                   />
                 </label>
               </div>
@@ -420,28 +444,34 @@ function App() {
                 onChange={(e) => setOptions({ ...options, lineEnding: e.target.value })}
                 className="mt-1 block w-full pl-3 pr-10 py-2 text-base border-gray-300 focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm rounded-md"
               >
-                <option value="LF">LF</option>
-                <option value="CRLF">CRLF</option>
-                <option value="CR">CR</option>
+                <option value="LF">LF (Unix)</option>
+                <option value="CRLF">CRLF (Windows)</option>
+                <option value="CR">CR (Mac)</option>
               </select>
             </div>
-            <div className="sm:col-span-2">
-              <label className="block text-sm font-medium text-gray-700">Remove Empty Lines</label>
+            <div className="flex items-center">
               <input
                 type="checkbox"
+                id="removeEmptyLines"
                 checked={options.removeEmptyLines}
                 onChange={(e) => setOptions({ ...options, removeEmptyLines: e.target.checked })}
-                className="mt-1 block w-full pl-3 pr-10 py-2 text-base border-gray-300 focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm rounded-md"
+                className="h-4 w-4 text-indigo-600 focus:ring-indigo-500 border-gray-300 rounded"
               />
+              <label htmlFor="removeEmptyLines" className="ml-2 block text-sm text-gray-900">
+                Remove Empty Lines
+              </label>
             </div>
-            <div className="sm:col-span-2">
-              <label className="block text-sm font-medium text-gray-700">Trim Whitespace</label>
+            <div className="flex items-center">
               <input
                 type="checkbox"
+                id="trimWhitespace"
                 checked={options.trimWhitespace}
                 onChange={(e) => setOptions({ ...options, trimWhitespace: e.target.checked })}
-                className="mt-1 block w-full pl-3 pr-10 py-2 text-base border-gray-300 focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm rounded-md"
+                className="h-4 w-4 text-indigo-600 focus:ring-indigo-500 border-gray-300 rounded"
               />
+              <label htmlFor="trimWhitespace" className="ml-2 block text-sm text-gray-900">
+                Trim Whitespace
+              </label>
             </div>
           </div>
           <div className="mt-4">
@@ -455,12 +485,15 @@ function App() {
           </div>
         </div>
 
-        <div className="mt-6 bg-white rounded-lg shadow p-6">
-          <h2 className="text-lg font-semibold text-gray-900">Error Logs</h2>
-          <pre className="mt-4 p-4 bg-gray-100 rounded-md overflow-auto max-h-64">
-            {errorLogs.join('')}
-          </pre>
-        </div>
+        {/* Error Logs */}
+        {errorLogs.length > 0 && (
+          <div className="mt-6 bg-white rounded-lg shadow p-6">
+            <h2 className="text-lg font-semibold text-gray-900 mb-4">Error Logs</h2>
+            <pre className="mt-2 p-4 bg-gray-100 rounded-md overflow-auto max-h-64 text-sm">
+              {errorLogs.join('')}
+            </pre>
+          </div>
+        )}
       </main>
     </div>
   );
